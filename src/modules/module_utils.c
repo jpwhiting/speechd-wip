@@ -26,16 +26,21 @@
 #endif
 
 #include <sndfile.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 
 #include <fdsetconv.h>
 #include <spd_utils.h>
 #include "module_utils.h"
-
-static char *module_audio_pars[10];
+#include <speechd_defines.h>
 
 extern char *module_index_mark;
 
 pthread_mutex_t module_stdout_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* Socket for sending audio data to */
+int audio_socket;
 
 char *do_message(SPDMessageType msgtype)
 {
@@ -93,11 +98,6 @@ char *do_message(SPDMessageType msgtype)
 	    && msg_settings.voice_type == msg_settings_old.voice_type) {
 		/* force to set voice again, since synthesis_voice changed to NULL */
 		msg_settings_old.voice_type = -1;
-	}
-
-	/* Volume is controlled by the synthesizer. Always play at normal on audio device. */
-	if (spd_audio_set_volume(module_audio_id, 85) < 0) {
-		DBG("Can't set volume. audio not initialized?");
 	}
 
 	ret = module_speak(msg->str, strlen(msg->str), msgtype);
@@ -267,92 +267,12 @@ char *do_set(void)
 	return g_strdup("401 ERROR INTERNAL");	/* Can't be reached */
 }
 
-#define SET_AUDIO_STR(name,idx) \
-	if(!strcmp(cur_item, #name)){ \
-		g_free(module_audio_pars[idx]); \
-		if(!strcmp(cur_value, "NULL")) module_audio_pars[idx] = NULL; \
-		else module_audio_pars[idx] = g_strdup(cur_value); \
-	}
-
-char *do_audio(void)
-{
-	char *cur_item = NULL;
-	char *cur_value = NULL;
-	char *line = NULL;
-	int ret;
-	size_t n;
-	int err = 0;		/* Error status */
-	char *status = NULL;
-	char *msg;
-
-	printf("207 OK RECEIVING AUDIO SETTINGS\n");
-	fflush(stdout);
-
-	while (1) {
-		line = NULL;
-		n = 0;
-		ret = spd_getline(&line, &n, stdin);
-		if (ret == -1) {
-			err = 1;
-			break;
-		}
-		if (!strcmp(line, ".\n")) {
-			g_free(line);
-			break;
-		}
-		if (!err) {
-			cur_item = strtok(line, "=");
-			if (cur_item == NULL) {
-				err = 1;
-				continue;
-			}
-			cur_value = strtok(NULL, "\n");
-			if (cur_value == NULL) {
-				err = 1;
-				continue;
-			}
-
-			SET_AUDIO_STR(audio_output_method, 0)
-			    else
-				SET_AUDIO_STR(audio_oss_device, 1)
-				    else
-				SET_AUDIO_STR(audio_alsa_device, 2)
-				    else
-				SET_AUDIO_STR(audio_nas_server, 3)
-				    else
-				SET_AUDIO_STR(audio_pulse_server, 4)
-				    else
-				SET_AUDIO_STR(audio_pulse_min_length, 5)
-				    else
-				/* 6 reserved for speech-dispatcher module name */
-				err = 2;	/* Unknown parameter */
-		}
-		g_free(line);
-	}
-
-	if (err == 1)
-		return g_strdup("302 ERROR BAD SYNTAX");
-	if (err == 2)
-		return g_strdup("303 ERROR INVALID PARAMETER OR VALUE");
-
-	err = module_audio_init(&status);
-
-	if (err == 0)
-		msg = g_strdup_printf("203 OK AUDIO INITIALIZED");
-	else
-		msg = g_strdup_printf("300-%s\n300 UNKNOWN ERROR", status);
-
-	g_free(status);
-	return msg;
-}
-
 #define SET_LOGLEVEL_NUM(name, cond) \
 	if(!strcmp(cur_item, #name)){ \
 		number = strtol(cur_value, &tptr, 10); \
 		if(!(cond)){ err = 2; continue; } \
 		if (tptr == cur_value){ err = 2; continue; } \
 		log_level = number; \
-		spd_audio_set_loglevel(module_audio_id, number); \
 	}
 
 char *do_loglevel(void)
@@ -516,9 +436,6 @@ void do_quit(void)
 {
 	printf("210 OK QUIT\n");
 	fflush(stdout);
-
-	spd_audio_close(module_audio_id);
-	module_audio_id = NULL;
 
 	module_close();
 	return;
@@ -983,53 +900,21 @@ configoption_t *module_add_config_option(configoption_t * options,
 	return opts;
 }
 
-int module_audio_init(char **status_info)
-{
-	char *error = 0;
-	gchar **outputs;
-	int i = 0;
-
-	DBG("Opening audio output system");
-	if (NULL == module_audio_pars[0]) {
-		*status_info =
-		    g_strdup
-		    ("Sound output method specified in configuration not supported. "
-		     "Please choose 'oss', 'alsa', 'nas', 'libao' or 'pulse'.");
-		return -1;
-	}
-
-	g_free(module_audio_pars[6]);
-	module_audio_pars[6] = strdup(module_name);
-
-	outputs = g_strsplit(module_audio_pars[0], ",", 0);
-	while (NULL != outputs[i]) {
-		module_audio_id =
-		    spd_audio_open(outputs[i], (void **)&module_audio_pars[1],
-				   &error);
-		if (module_audio_id) {
-			DBG("Using %s audio output method", outputs[i]);
-			g_strfreev(outputs);
-			*status_info =
-			    g_strdup("audio initialized successfully.");
-			return 0;
-		}
-		i++;
-	}
-
-	*status_info =
-	    g_strdup_printf("Opening sound device failed. Reason: %s. ", error);
-	g_free(error);		/* g_malloc'ed, in spd_audio_open. */
-
-	g_strfreev(outputs);
-	return -1;
-
-}
-
 int module_tts_output(AudioTrack track, AudioFormat format)
 {
-
-	if (spd_audio_play(module_audio_id, track, format) < 0) {
-		DBG("Can't play track for unknown reason.");
+	/* Send audiotrack data to the socket */
+	char *metadata = g_strdup_printf("%d:%d:%d:%d:%d"NEWLINE,
+					 format,
+					 track.bits,
+					 track.num_channels,
+					 track.sample_rate,
+					 track.num_samples);
+	if (send(audio_socket, metadata, strlen(metadata), 0) == -1) {
+		DBG("Can't send audiotrack metadata for some reason.");
+		return -1;
+	}
+	if (send(audio_socket, track.samples, track.num_samples * sizeof(signed short), 0) == -1) {
+		DBG("Can't send audio samples for some reason.");
 		return -1;
 	}
 	return 0;
